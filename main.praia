@@ -1,0 +1,63 @@
+// pcap — libpcap packet capture for Praia
+//
+// Capture live traffic, read/write pcap files, and apply BPF filters.
+// Requires root or CAP_NET_RAW for live capture.
+//
+// Usage:
+//   use "pcap"
+//
+//   // Live capture with filter
+//   let cap = pcap.openLive("en0")
+//   pcap.setFilter(cap, "tcp port 80")
+//   while (true) {
+//       let pkt = pcap.next(cap)
+//       if (pkt) { print("got", pkt.caplen, "bytes") }
+//   }
+//   pcap.close(cap)
+//
+//   // Read a pcap file
+//   let cap = pcap.openFile("dump.pcap")
+//   let pkt = pcap.next(cap)
+//   while (pkt) {
+//       print(pkt.timestamp, pkt.len)
+//       pkt = pcap.next(cap)
+//   }
+//   pcap.close(cap)
+//
+//   // Write captured packets to file
+//   let cap = pcap.openLive("en0")
+//   pcap.dumpOpen(cap, "out.pcap")
+//   let pkt = pcap.next(cap)
+//   if (pkt) { pcap.dump(cap, pkt.data, pkt.timestamp) }
+//   pcap.dumpClose(cap)
+//   pcap.close(cap)
+
+let ext = ".dylib"
+if (sys.platform != "darwin") {
+    let arch = sys.exec(["uname", "-m"]).stdout.strip()
+    ext = "-linux-" + arch + ".so"
+}
+
+let _native = loadNative(path.dirname(sys.currentFile()) + "/plugins/pcap" + ext)
+
+let openLive = _native.openLive
+let openFile = _native.openFile
+let setFilter = _native.setFilter
+let next = _native.next
+let breakLoop = _native.breakLoop
+let stats = _native.stats
+let datalink = _native.datalink
+let dumpOpen = _native.dumpOpen
+let dump = _native.dump
+let dumpFlush = _native.dumpFlush
+let dumpClose = _native.dumpClose
+let close = _native.close
+let devices = _native.devices
+let DLT_EN10MB = _native.DLT_EN10MB
+
+export {
+    openLive, openFile, setFilter,
+    next, breakLoop, stats, datalink,
+    dumpOpen, dump, dumpFlush, dumpClose, close,
+    devices, DLT_EN10MB
+}

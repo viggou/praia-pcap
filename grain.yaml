@@ -1,0 +1,7 @@
+name: pcap
+version: 1.0.0
+description: libpcap packet capture bindings
+author: Viggo Lekdorf
+license: MIT
+main: main.praia
+dependencies:
