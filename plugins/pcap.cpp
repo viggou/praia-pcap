@@ -4,7 +4,9 @@
 #define _XOPEN_SOURCE 700
 
 #include "praia_plugin.h"
+#include "signal_state.h"
 
+#include <csignal>
 #include <cstring>
 #include <sys/time.h>
 #include <unordered_map>
@@ -94,6 +96,10 @@ extern "C" void praia_register(PraiaMap* module) {
             struct pcap_pkthdr* hdr;
             const u_char* pkt;
             int rc = pcap_next_ex(it->second.handle, &hdr, &pkt);
+
+            // Check for Ctrl+C after blocking call returns
+            if (g_pendingSignals.load(std::memory_order_relaxed) & (1u << SIGINT))
+                throw RuntimeError("Interrupted", 0);
 
             if (rc == 0) return Value(); // timeout
             if (rc == PCAP_ERROR_BREAK) return Value(); // EOF (offline) or breakloop
