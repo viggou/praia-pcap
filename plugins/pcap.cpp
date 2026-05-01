@@ -10,6 +10,7 @@
 #include <csignal>
 #include <cstring>
 #include <sys/time.h>
+#include <unistd.h>
 #include <unordered_map>
 #include <vector>
 #include <pcap/pcap.h>
@@ -40,6 +41,14 @@ extern "C" void praia_register(PraiaMap* module) {
             pcap_t* p = pcap_open_live(iface.c_str(), snaplen, promisc, timeoutMs, errbuf);
             if (!p)
                 throw RuntimeError("pcap.openLive(): " + std::string(errbuf), 0);
+
+            // Set non-blocking so pcap_next_ex returns immediately.
+            // We manage timeouts ourselves to stay responsive to Ctrl+C.
+            // The pcap timeout still controls TPACKET_V3 block retirement.
+            if (pcap_setnonblock(p, 1, errbuf) < 0) {
+                pcap_close(p);
+                throw RuntimeError("pcap.openLive(): " + std::string(errbuf), 0);
+            }
 
             int64_t id = nextId++;
             handles[id] = {p, nullptr, timeoutMs, true};
@@ -87,8 +96,9 @@ extern "C" void praia_register(PraiaMap* module) {
         }));
 
     // pcap.next(handle) -> {data, timestamp, caplen, len} or nil
-    // Calls pcap_next_ex once (blocks up to the handle's timeout), then
-    // checks for Ctrl+C. Worst-case signal response time = timeout duration.
+    // Live handles are non-blocking: pcap_next_ex returns immediately.
+    // We loop with short sleeps (10ms) until a packet arrives, the timeout
+    // expires, or Ctrl+C is detected. Offline handles call pcap_next_ex once.
     module->entries["next"] = Value(makeNative("pcap.next", 1,
         [](const std::vector<Value>& args) -> Value {
             if (!args[0].isInt())
@@ -98,24 +108,52 @@ extern "C" void praia_register(PraiaMap* module) {
             if (it == handles.end())
                 throw RuntimeError("pcap.next(): invalid handle", 0);
 
-            struct pcap_pkthdr* hdr;
-            const u_char* pkt;
-            int rc = pcap_next_ex(it->second.handle, &hdr, &pkt);
+            auto& ph = it->second;
 
-            if (g_pendingSignals.load(std::memory_order_relaxed) & (1u << SIGINT))
-                throw RuntimeError("Interrupted", 0);
+            // Offline: single blocking call
+            if (!ph.isLive) {
+                struct pcap_pkthdr* hdr;
+                const u_char* pkt;
+                int rc = pcap_next_ex(ph.handle, &hdr, &pkt);
+                if (rc <= 0) return Value();
+                auto result = gcNew<PraiaMap>();
+                result->entries["data"] = Value(std::string(reinterpret_cast<const char*>(pkt), hdr->caplen));
+                result->entries["timestamp"] = Value(static_cast<double>(hdr->ts.tv_sec) + static_cast<double>(hdr->ts.tv_usec) / 1000000.0);
+                result->entries["caplen"] = Value(static_cast<int64_t>(hdr->caplen));
+                result->entries["len"] = Value(static_cast<int64_t>(hdr->len));
+                return Value(result);
+            }
 
-            if (rc == 0) return Value(); // timeout
-            if (rc == PCAP_ERROR_BREAK) return Value(); // EOF or breakloop
-            if (rc < 0)
-                throw RuntimeError("pcap.next(): " + std::string(pcap_geterr(it->second.handle)), 0);
+            // Live: non-blocking loop with signal checks
+            auto start = std::chrono::steady_clock::now();
 
-            auto result = gcNew<PraiaMap>();
-            result->entries["data"] = Value(std::string(reinterpret_cast<const char*>(pkt), hdr->caplen));
-            result->entries["timestamp"] = Value(static_cast<double>(hdr->ts.tv_sec) + static_cast<double>(hdr->ts.tv_usec) / 1000000.0);
-            result->entries["caplen"] = Value(static_cast<int64_t>(hdr->caplen));
-            result->entries["len"] = Value(static_cast<int64_t>(hdr->len));
-            return Value(result);
+            while (true) {
+                if (g_pendingSignals.load(std::memory_order_relaxed) & (1u << SIGINT))
+                    throw RuntimeError("Interrupted", 0);
+
+                auto elapsed = std::chrono::duration_cast<std::chrono::milliseconds>(
+                    std::chrono::steady_clock::now() - start).count();
+                if (elapsed >= ph.timeoutMs) return Value();
+
+                struct pcap_pkthdr* hdr;
+                const u_char* pkt;
+                int rc = pcap_next_ex(ph.handle, &hdr, &pkt);
+
+                if (rc > 0) {
+                    auto result = gcNew<PraiaMap>();
+                    result->entries["data"] = Value(std::string(reinterpret_cast<const char*>(pkt), hdr->caplen));
+                    result->entries["timestamp"] = Value(static_cast<double>(hdr->ts.tv_sec) + static_cast<double>(hdr->ts.tv_usec) / 1000000.0);
+                    result->entries["caplen"] = Value(static_cast<int64_t>(hdr->caplen));
+                    result->entries["len"] = Value(static_cast<int64_t>(hdr->len));
+                    return Value(result);
+                }
+                if (rc == PCAP_ERROR_BREAK) return Value();
+                if (rc < 0)
+                    throw RuntimeError("pcap.next(): " + std::string(pcap_geterr(ph.handle)), 0);
+
+                // No packet yet — sleep 10ms to avoid busy-spinning
+                usleep(10000);
+            }
         }));
 
     // pcap.breakLoop(handle) -> nil
