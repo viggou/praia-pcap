@@ -9,7 +9,6 @@
 #include <chrono>
 #include <csignal>
 #include <cstring>
-#include <poll.h>
 #include <sys/time.h>
 #include <unordered_map>
 #include <vector>
@@ -88,8 +87,8 @@ extern "C" void praia_register(PraiaMap* module) {
         }));
 
     // pcap.next(handle) -> {data, timestamp, caplen, len} or nil
-    // Uses poll() to avoid blocking indefinitely — some drivers ignore
-    // the pcap timeout in monitor mode. Checks for Ctrl+C every 100ms.
+    // Calls pcap_next_ex once (blocks up to the handle's timeout), then
+    // checks for Ctrl+C. Worst-case signal response time = timeout duration.
     module->entries["next"] = Value(makeNative("pcap.next", 1,
         [](const std::vector<Value>& args) -> Value {
             if (!args[0].isInt())
@@ -99,63 +98,24 @@ extern "C" void praia_register(PraiaMap* module) {
             if (it == handles.end())
                 throw RuntimeError("pcap.next(): invalid handle", 0);
 
-            auto& ph = it->second;
+            struct pcap_pkthdr* hdr;
+            const u_char* pkt;
+            int rc = pcap_next_ex(it->second.handle, &hdr, &pkt);
 
-            // For offline captures or when we can't get an fd, fall back to direct call
-            int fd = pcap_get_selectable_fd(ph.handle);
-            if (!ph.isLive || fd < 0) {
-                struct pcap_pkthdr* hdr;
-                const u_char* pkt;
-                int rc = pcap_next_ex(ph.handle, &hdr, &pkt);
-                if (g_pendingSignals.load(std::memory_order_relaxed) & (1u << SIGINT))
-                    throw RuntimeError("Interrupted", 0);
-                if (rc <= 0) return Value();
-                if (rc < 0)
-                    throw RuntimeError("pcap.next(): " + std::string(pcap_geterr(ph.handle)), 0);
-                auto result = gcNew<PraiaMap>();
-                result->entries["data"] = Value(std::string(reinterpret_cast<const char*>(pkt), hdr->caplen));
-                result->entries["timestamp"] = Value(static_cast<double>(hdr->ts.tv_sec) + static_cast<double>(hdr->ts.tv_usec) / 1000000.0);
-                result->entries["caplen"] = Value(static_cast<int64_t>(hdr->caplen));
-                result->entries["len"] = Value(static_cast<int64_t>(hdr->len));
-                return Value(result);
-            }
+            if (g_pendingSignals.load(std::memory_order_relaxed) & (1u << SIGINT))
+                throw RuntimeError("Interrupted", 0);
 
-            // Live capture: poll with short timeouts for signal responsiveness
-            auto start = std::chrono::steady_clock::now();
+            if (rc == 0) return Value(); // timeout
+            if (rc == PCAP_ERROR_BREAK) return Value(); // EOF or breakloop
+            if (rc < 0)
+                throw RuntimeError("pcap.next(): " + std::string(pcap_geterr(it->second.handle)), 0);
 
-            while (true) {
-                if (g_pendingSignals.load(std::memory_order_relaxed) & (1u << SIGINT))
-                    throw RuntimeError("Interrupted", 0);
-
-                auto elapsed = std::chrono::duration_cast<std::chrono::milliseconds>(
-                    std::chrono::steady_clock::now() - start).count();
-                if (elapsed >= ph.timeoutMs) return Value(); // timeout
-
-                int remaining = ph.timeoutMs - static_cast<int>(elapsed);
-                int pollMs = std::min(remaining, 100); // check signals every 100ms
-
-                struct pollfd pfd = {fd, POLLIN, 0};
-                int pr = poll(&pfd, 1, pollMs);
-
-                if (pr > 0) {
-                    struct pcap_pkthdr* hdr;
-                    const u_char* pkt;
-                    int rc = pcap_next_ex(ph.handle, &hdr, &pkt);
-                    if (rc > 0) {
-                        auto result = gcNew<PraiaMap>();
-                        result->entries["data"] = Value(std::string(reinterpret_cast<const char*>(pkt), hdr->caplen));
-                        result->entries["timestamp"] = Value(static_cast<double>(hdr->ts.tv_sec) + static_cast<double>(hdr->ts.tv_usec) / 1000000.0);
-                        result->entries["caplen"] = Value(static_cast<int64_t>(hdr->caplen));
-                        result->entries["len"] = Value(static_cast<int64_t>(hdr->len));
-                        return Value(result);
-                    }
-                    if (rc == PCAP_ERROR_BREAK) return Value();
-                    if (rc < 0)
-                        throw RuntimeError("pcap.next(): " + std::string(pcap_geterr(ph.handle)), 0);
-                }
-                // pr == 0: poll timeout, loop to check signals
-                // pr < 0: EINTR from signal, loop to check signals
-            }
+            auto result = gcNew<PraiaMap>();
+            result->entries["data"] = Value(std::string(reinterpret_cast<const char*>(pkt), hdr->caplen));
+            result->entries["timestamp"] = Value(static_cast<double>(hdr->ts.tv_sec) + static_cast<double>(hdr->ts.tv_usec) / 1000000.0);
+            result->entries["caplen"] = Value(static_cast<int64_t>(hdr->caplen));
+            result->entries["len"] = Value(static_cast<int64_t>(hdr->len));
+            return Value(result);
         }));
 
     // pcap.breakLoop(handle) -> nil
