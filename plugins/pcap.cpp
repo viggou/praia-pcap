@@ -13,6 +13,10 @@
 #include <vector>
 #include <pcap/pcap.h>
 
+PRAIA_DECLARE_ABI();
+PRAIA_PLUGIN_METADATA("pcap", "0.2.0",
+                     "libpcap bindings for Praia");
+
 struct PcapHandle {
     pcap_t* handle = nullptr;
     pcap_dumper_t* dumper = nullptr;
@@ -20,6 +24,24 @@ struct PcapHandle {
 
 static std::unordered_map<int64_t, PcapHandle> handles;
 static int64_t nextId = 1;
+
+// Process-exit hook — flush + close any open pcap handles so capture
+// files aren't truncated on script crashes or sys.exit(). Closing the
+// dumper before the handle is the documented libpcap order.
+extern "C" void praia_at_exit(void) {
+    for (auto& [id, h] : handles) {
+        if (h.dumper) {
+            pcap_dump_flush(h.dumper);
+            pcap_dump_close(h.dumper);
+            h.dumper = nullptr;
+        }
+        if (h.handle) {
+            pcap_close(h.handle);
+            h.handle = nullptr;
+        }
+    }
+    handles.clear();
+}
 
 extern "C" void praia_register(PraiaMap* module) {
     // pcap.openLive(iface, snaplen?, promisc?, timeoutMs?) -> handle
@@ -100,6 +122,15 @@ extern "C" void praia_register(PraiaMap* module) {
             // Check for Ctrl+C after pcap_next_ex returns
             if (g_pendingSignals.load(std::memory_order_relaxed) & (1u << SIGINT))
                 throw RuntimeError("Interrupted", 0);
+
+            // And cooperative cancellation. Inside a withCancel scope,
+            // the user can flip the token and we treat the next return
+            // as a timeout — their loop checks tok.cancelled() and
+            // bails. Mirrors the SIGINT handling above without
+            // throwing, so the user's frame-processing loop can clean
+            // up gracefully.
+            auto cancelled = praia::shouldCancel();
+            if (cancelled && *cancelled) return Value();
 
             if (rc == 0) return Value(); // timeout
             if (rc == PCAP_ERROR_BREAK) return Value(); // EOF or breakloop

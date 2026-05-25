@@ -1,5 +1,5 @@
 name: pcap
-version: 1.0.4
+version: 1.1.0
 description: libpcap packet capture bindings
 author: Viggo Lekdorf
 license: MIT
