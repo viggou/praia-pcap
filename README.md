@@ -88,12 +88,12 @@ pcap.close(cap)
 
 | Function | Description |
 |----------|-------------|
-| `openLive(iface, snaplen?, promisc?, timeoutMs?)` | Open live capture. Defaults: snaplen=65535, promisc=true, timeout=1000ms |
+| `openLive(iface, snaplen?, promisc?, timeoutMs?)` | Open live capture. Defaults (also for `nil`): snaplen=65535, promisc=true, timeout=1000ms. The timeout must be at least 1ms |
 | `openFile(path)` | Open a pcap file for reading |
 | `setFilter(handle, filter)` | Apply a BPF filter (e.g. `"tcp port 80"`, `"arp"`, `"host 10.0.0.1"`) |
 | `next(handle)` | Read next packet. Returns `{data, timestamp, caplen, len}` or nil on timeout/EOF |
-| `breakLoop(handle)` | Break out of a capture loop |
-| `close(handle)` | Close the capture handle and any attached dump file |
+| `breakLoop(handle)` | Make a `next` waiting in another task return nil |
+| `close(handle)` | Close the capture handle and any attached dump file. Closing twice is fine |
 
 ### Writing
 
@@ -116,6 +116,11 @@ pcap.close(cap)
 | Constant | Value | Description |
 |----------|-------|-------------|
 | `DLT_EN10MB` | 1 | Ethernet datalink type |
+| `DLT_IEEE802_11_RADIO` | 127 | 802.11 with radiotap headers (monitor mode) |
+
+### Handles
+
+`openLive` and `openFile` return a handle (`<external:pcap.handle>`). A handle that's no longer used is closed automatically, along with its dump file; `close` does it right away. Using a closed handle, or passing something else as one, throws. Async tasks can share a handle: calls on it are serialized, and `breakLoop` from one task interrupts a `next` waiting in another.
 
 ## Building from source
 

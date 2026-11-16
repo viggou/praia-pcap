@@ -54,10 +54,11 @@ let dumpClose = _native.dumpClose
 let close = _native.close
 let devices = _native.devices
 let DLT_EN10MB = _native.DLT_EN10MB
+let DLT_IEEE802_11_RADIO = _native.DLT_IEEE802_11_RADIO
 
 export {
     openLive, openFile, setFilter,
     next, breakLoop, stats, datalink,
     dumpOpen, dump, dumpFlush, dumpClose, close,
-    devices, DLT_EN10MB
+    devices, DLT_EN10MB, DLT_IEEE802_11_RADIO
 }

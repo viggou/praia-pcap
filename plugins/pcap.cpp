@@ -6,100 +6,174 @@
 #include "praia_plugin.h"
 #include "signal_state.h"
 
+#include <cmath>
 #include <csignal>
 #include <cstring>
+#include <mutex>
 #include <sys/time.h>
-#include <unordered_map>
+#include <unordered_set>
 #include <vector>
 #include <pcap/pcap.h>
 
 PRAIA_DECLARE_ABI();
-PRAIA_PLUGIN_METADATA("pcap", "0.2.0",
+PRAIA_PLUGIN_METADATA("pcap", "1.1.1",
                      "libpcap bindings for Praia");
 
+// A capture handle. Async tasks can share one, so:
+//   opMu serializes libpcap calls on it (held through a blocking next()),
+//   stateMu guards just the pointers, held only for a moment. breakLoop
+//   takes only stateMu, so it can interrupt a next() blocked in another
+//   task, and close() takes both, so neither ever sees a freed handle.
 struct PcapHandle {
+    std::mutex opMu;
+    std::mutex stateMu;
     pcap_t* handle = nullptr;
     pcap_dumper_t* dumper = nullptr;
 };
+static const char* kHandleType = "pcap.handle";
 
-static std::unordered_map<int64_t, PcapHandle> handles;
-static int64_t nextId = 1;
+// Live handles, for the exit hook. Leaked on purpose: deleters can run
+// during process teardown, after statics are destroyed
+static std::mutex g_regMu;
+static auto* g_handles = new std::unordered_set<PcapHandle*>();
+
+// Closes the dumper, then the handle (the documented libpcap order).
+// Call with opMu held; takes stateMu itself
+static void closeHandle(PcapHandle* h) {
+    std::lock_guard<std::mutex> state(h->stateMu);
+    if (h->dumper) {
+        pcap_dump_flush(h->dumper);
+        pcap_dump_close(h->dumper);
+        h->dumper = nullptr;
+    }
+    if (h->handle) {
+        pcap_close(h->handle);
+        h->handle = nullptr;
+    }
+}
+
+// The handle's deleter. Nothing else can be using it (whoever did held a
+// reference), so the locks are uncontended
+static void freeHandle(PcapHandle* h) {
+    {
+        std::lock_guard<std::mutex> reg(g_regMu);
+        g_handles->erase(h);
+    }
+    {
+        std::lock_guard<std::mutex> op(h->opMu);
+        closeHandle(h);
+    }
+    delete h;
+}
 
 // Process-exit hook — flush + close any open pcap handles so capture
-// files aren't truncated on script crashes or sys.exit(). Closing the
-// dumper before the handle is the documented libpcap order.
+// files aren't truncated on script crashes or sys.exit(). An unawaited
+// task may still be in next(), so each capture is told to stop first
 extern "C" void praia_at_exit(void) {
-    for (auto& [id, h] : handles) {
-        if (h.dumper) {
-            pcap_dump_flush(h.dumper);
-            pcap_dump_close(h.dumper);
-            h.dumper = nullptr;
+    std::lock_guard<std::mutex> reg(g_regMu);
+    for (auto* h : *g_handles) {
+        {
+            std::lock_guard<std::mutex> state(h->stateMu);
+            if (h->handle) pcap_breakloop(h->handle);
         }
-        if (h.handle) {
-            pcap_close(h.handle);
-            h.handle = nullptr;
-        }
+        std::lock_guard<std::mutex> op(h->opMu);
+        closeHandle(h);
     }
-    handles.clear();
+}
+
+// ── Argument helpers ──
+
+static PcapHandle* argHandle(const std::vector<Value>& args, size_t i, const std::string& fn) {
+    if (i >= args.size() || !args[i].isExternal())
+        praia::error(fn + "() argument " + std::to_string(i + 1) + " must be a pcap handle");
+    return praia::getExternal<PcapHandle>(args[i], kHandleType);
+}
+
+// The handle's pcap_t, with opMu held by the caller
+static pcap_t* openPcap(PcapHandle* h, const std::string& fn) {
+    if (!h->handle) praia::error(fn + "(): the handle is closed");
+    return h->handle;
+}
+
+// An optional int argument: missing or nil gives the default
+static int optInt(const std::vector<Value>& args, size_t i, int def, int lo, int hi,
+                  const std::string& fn, const char* what) {
+    if (i >= args.size() || args[i].isNil()) return def;
+    int64_t v = praia::requireInt(args, i, fn);
+    if (v < lo || v > hi)
+        praia::error(fn + "(): " + what + " must be between " + std::to_string(lo) +
+                     " and " + std::to_string(hi));
+    return static_cast<int>(v);
+}
+
+static Value wrapHandle(pcap_t* p) {
+    auto* h = new PcapHandle();
+    h->handle = p;
+    {
+        std::lock_guard<std::mutex> reg(g_regMu);
+        g_handles->insert(h);
+    }
+    return praia::makeExternal<PcapHandle>(h, kHandleType, freeHandle);
+}
+
+static bool interrupted() {
+    return g_pendingSignals.load(std::memory_order_relaxed) & (1u << SIGINT);
+}
+
+static bool cancelled() {
+    auto c = praia::shouldCancel();
+    return c && *c;
 }
 
 extern "C" void praia_register(PraiaMap* module) {
     // pcap.openLive(iface, snaplen?, promisc?, timeoutMs?) -> handle
     module->entries["openLive"] = Value(makeNative("pcap.openLive", -1,
         [](const std::vector<Value>& args) -> Value {
-            if (args.empty() || !args[0].isString())
-                throw RuntimeError("pcap.openLive() requires interface name", 0);
-
-            const auto& iface = args[0].asString();
-            int snaplen = (args.size() > 1 && args[1].isInt()) ? static_cast<int>(args[1].asInt()) : 65535;
-            int promisc = (args.size() > 2 && args[2].isBool()) ? (args[2].asBool() ? 1 : 0) : 1;
-            int timeoutMs = (args.size() > 3 && args[3].isInt()) ? static_cast<int>(args[3].asInt()) : 1000;
+            const std::string fn = "pcap.openLive";
+            praia::requireArityRange(args, 1, 4, fn);
+            const auto& iface = praia::requireString(args, 0, fn);
+            int snaplen = optInt(args, 1, 65535, 1, 262144, fn, "snaplen");
+            int promisc = 1;
+            if (args.size() > 2 && !args[2].isNil())
+                promisc = praia::requireBool(args, 2, fn) ? 1 : 0;
+            // 0 would mean "wait forever" on Linux, which nothing could
+            // interrupt; next() returns nil on each timeout instead
+            int timeoutMs = optInt(args, 3, 1000, 1, 3600000, fn, "timeoutMs");
 
             char errbuf[PCAP_ERRBUF_SIZE];
             pcap_t* p = pcap_open_live(iface.c_str(), snaplen, promisc, timeoutMs, errbuf);
             if (!p)
-                throw RuntimeError("pcap.openLive(): " + std::string(errbuf), 0);
-
-            int64_t id = nextId++;
-            handles[id] = {p, nullptr};
-            return Value(id);
+                praia::error(fn + "(): " + std::string(errbuf));
+            return wrapHandle(p);
         }));
 
     // pcap.openFile(path) -> handle
     module->entries["openFile"] = Value(makeNative("pcap.openFile", 1,
         [](const std::vector<Value>& args) -> Value {
-            if (!args[0].isString())
-                throw RuntimeError("pcap.openFile() requires file path", 0);
-
+            const std::string fn = "pcap.openFile";
+            const auto& path = praia::requireString(args, 0, fn);
             char errbuf[PCAP_ERRBUF_SIZE];
-            pcap_t* p = pcap_open_offline(args[0].asString().c_str(), errbuf);
+            pcap_t* p = pcap_open_offline(path.c_str(), errbuf);
             if (!p)
-                throw RuntimeError("pcap.openFile(): " + std::string(errbuf), 0);
-
-            int64_t id = nextId++;
-            handles[id] = {p, nullptr};
-            return Value(id);
+                praia::error(fn + "(): " + std::string(errbuf));
+            return wrapHandle(p);
         }));
 
     // pcap.setFilter(handle, filter) -> nil
     module->entries["setFilter"] = Value(makeNative("pcap.setFilter", 2,
         [](const std::vector<Value>& args) -> Value {
-            if (!args[0].isInt())
-                throw RuntimeError("pcap.setFilter() requires handle", 0);
-            if (!args[1].isString())
-                throw RuntimeError("pcap.setFilter() requires filter string", 0);
-
-            auto it = handles.find(args[0].asInt());
-            if (it == handles.end())
-                throw RuntimeError("pcap.setFilter(): invalid handle", 0);
+            const std::string fn = "pcap.setFilter";
+            auto* h = argHandle(args, 0, fn);
+            const auto& filter = praia::requireString(args, 1, fn);
+            std::lock_guard<std::mutex> op(h->opMu);
+            pcap_t* p = openPcap(h, fn);
 
             struct bpf_program fp;
-            if (pcap_compile(it->second.handle, &fp, args[1].asString().c_str(), 1, PCAP_NETMASK_UNKNOWN) < 0)
-                throw RuntimeError("pcap.setFilter(): " + std::string(pcap_geterr(it->second.handle)), 0);
-
-            if (pcap_setfilter(it->second.handle, &fp) < 0) {
+            if (pcap_compile(p, &fp, filter.c_str(), 1, PCAP_NETMASK_UNKNOWN) < 0)
+                praia::error(fn + "(): " + std::string(pcap_geterr(p)));
+            if (pcap_setfilter(p, &fp) < 0) {
                 pcap_freecode(&fp);
-                throw RuntimeError("pcap.setFilter(): " + std::string(pcap_geterr(it->second.handle)), 0);
+                praia::error(fn + "(): " + std::string(pcap_geterr(p)));
             }
             pcap_freecode(&fp);
             return Value();
@@ -108,70 +182,59 @@ extern "C" void praia_register(PraiaMap* module) {
     // pcap.next(handle) -> {data, timestamp, caplen, len} or nil
     module->entries["next"] = Value(makeNative("pcap.next", 1,
         [](const std::vector<Value>& args) -> Value {
-            if (!args[0].isInt())
-                throw RuntimeError("pcap.next() requires handle", 0);
+            const std::string fn = "pcap.next";
+            auto* h = argHandle(args, 0, fn);
 
-            auto it = handles.find(args[0].asInt());
-            if (it == handles.end())
-                throw RuntimeError("pcap.next(): invalid handle", 0);
+            // Ctrl+C and cooperative cancellation are checked before
+            // reading, so a packet already read is always returned. Inside
+            // a withCancel scope a cancelled token reads as a timeout: the
+            // user's loop checks tok.cancelled() and cleans up
+            if (interrupted()) praia::error("Interrupted");
+            if (cancelled()) return Value();
 
+            std::lock_guard<std::mutex> op(h->opMu);
+            pcap_t* p = openPcap(h, fn);
             struct pcap_pkthdr* hdr;
             const u_char* pkt;
-            int rc = pcap_next_ex(it->second.handle, &hdr, &pkt);
+            int rc = pcap_next_ex(p, &hdr, &pkt);
 
-            // Check for Ctrl+C after pcap_next_ex returns
-            if (g_pendingSignals.load(std::memory_order_relaxed) & (1u << SIGINT))
-                throw RuntimeError("Interrupted", 0);
-
-            // And cooperative cancellation. Inside a withCancel scope,
-            // the user can flip the token and we treat the next return
-            // as a timeout — their loop checks tok.cancelled() and
-            // bails. Mirrors the SIGINT handling above without
-            // throwing, so the user's frame-processing loop can clean
-            // up gracefully.
-            auto cancelled = praia::shouldCancel();
-            if (cancelled && *cancelled) return Value();
-
-            if (rc == 0) return Value(); // timeout
-            if (rc == PCAP_ERROR_BREAK) return Value(); // EOF or breakloop
-            if (rc < 0)
-                throw RuntimeError("pcap.next(): " + std::string(pcap_geterr(it->second.handle)), 0);
-
-            auto result = gcNew<PraiaMap>();
-            result->entries["data"] = Value(std::string(reinterpret_cast<const char*>(pkt), hdr->caplen));
-            result->entries["timestamp"] = Value(static_cast<double>(hdr->ts.tv_sec) + static_cast<double>(hdr->ts.tv_usec) / 1000000.0);
-            result->entries["caplen"] = Value(static_cast<int64_t>(hdr->caplen));
-            result->entries["len"] = Value(static_cast<int64_t>(hdr->len));
-            return Value(result);
+            if (rc == 1) {
+                auto result = gcNew<PraiaMap>();
+                result->entries["data"] = Value(std::string(reinterpret_cast<const char*>(pkt), hdr->caplen));
+                result->entries["timestamp"] = Value(static_cast<double>(hdr->ts.tv_sec) + static_cast<double>(hdr->ts.tv_usec) / 1000000.0);
+                result->entries["caplen"] = Value(static_cast<int64_t>(hdr->caplen));
+                result->entries["len"] = Value(static_cast<int64_t>(hdr->len));
+                return Value(result);
+            }
+            // Ctrl+C pressed while waiting
+            if (interrupted()) praia::error("Interrupted");
+            if (rc == 0) return Value();                 // timeout
+            if (rc == PCAP_ERROR_BREAK) return Value();  // EOF or breakLoop
+            praia::error(fn + "(): " + std::string(pcap_geterr(p)));
         }));
 
     // pcap.breakLoop(handle) -> nil
+    // Safe from another task while one is blocked in next(): it takes only
+    // the state lock, and that next() returns nil
     module->entries["breakLoop"] = Value(makeNative("pcap.breakLoop", 1,
         [](const std::vector<Value>& args) -> Value {
-            if (!args[0].isInt())
-                throw RuntimeError("pcap.breakLoop() requires handle", 0);
-
-            auto it = handles.find(args[0].asInt());
-            if (it == handles.end())
-                throw RuntimeError("pcap.breakLoop(): invalid handle", 0);
-
-            pcap_breakloop(it->second.handle);
+            auto* h = argHandle(args, 0, "pcap.breakLoop");
+            std::lock_guard<std::mutex> state(h->stateMu);
+            if (h->handle) pcap_breakloop(h->handle);
             return Value();
         }));
 
     // pcap.stats(handle) -> {recv, drop, ifdrop}
     module->entries["stats"] = Value(makeNative("pcap.stats", 1,
         [](const std::vector<Value>& args) -> Value {
-            if (!args[0].isInt())
-                throw RuntimeError("pcap.stats() requires handle", 0);
-
-            auto it = handles.find(args[0].asInt());
-            if (it == handles.end())
-                throw RuntimeError("pcap.stats(): invalid handle", 0);
+            const std::string fn = "pcap.stats";
+            auto* h = argHandle(args, 0, fn);
+            std::lock_guard<std::mutex> op(h->opMu);
+            pcap_t* p = openPcap(h, fn);
 
             struct pcap_stat ps;
-            if (pcap_stats(it->second.handle, &ps) < 0)
-                throw RuntimeError("pcap.stats(): " + std::string(pcap_geterr(it->second.handle)), 0);
+            if (pcap_stats(p, &ps) < 0)
+                praia::error(fn + "(): " + std::string(pcap_geterr(p)));
 
             auto result = gcNew<PraiaMap>();
             result->entries["recv"] = Value(static_cast<int64_t>(ps.ps_recv));
@@ -183,67 +246,61 @@ extern "C" void praia_register(PraiaMap* module) {
     // pcap.datalink(handle) -> int
     module->entries["datalink"] = Value(makeNative("pcap.datalink", 1,
         [](const std::vector<Value>& args) -> Value {
-            if (!args[0].isInt())
-                throw RuntimeError("pcap.datalink() requires handle", 0);
-
-            auto it = handles.find(args[0].asInt());
-            if (it == handles.end())
-                throw RuntimeError("pcap.datalink(): invalid handle", 0);
-
-            return Value(static_cast<int64_t>(pcap_datalink(it->second.handle)));
+            const std::string fn = "pcap.datalink";
+            auto* h = argHandle(args, 0, fn);
+            std::lock_guard<std::mutex> op(h->opMu);
+            return Value(static_cast<int64_t>(pcap_datalink(openPcap(h, fn))));
         }));
 
     // pcap.dumpOpen(handle, path) -> nil (attaches dumper to handle)
     module->entries["dumpOpen"] = Value(makeNative("pcap.dumpOpen", 2,
         [](const std::vector<Value>& args) -> Value {
-            if (!args[0].isInt())
-                throw RuntimeError("pcap.dumpOpen() requires handle", 0);
-            if (!args[1].isString())
-                throw RuntimeError("pcap.dumpOpen() requires file path", 0);
+            const std::string fn = "pcap.dumpOpen";
+            auto* h = argHandle(args, 0, fn);
+            const auto& path = praia::requireString(args, 1, fn);
+            std::lock_guard<std::mutex> op(h->opMu);
+            pcap_t* p = openPcap(h, fn);
 
-            auto it = handles.find(args[0].asInt());
-            if (it == handles.end())
-                throw RuntimeError("pcap.dumpOpen(): invalid handle", 0);
-
-            if (it->second.dumper) {
-                pcap_dump_close(it->second.dumper);
-                it->second.dumper = nullptr;
-            }
-
-            pcap_dumper_t* d = pcap_dump_open(it->second.handle, args[1].asString().c_str());
+            pcap_dumper_t* d = pcap_dump_open(p, path.c_str());
             if (!d)
-                throw RuntimeError("pcap.dumpOpen(): " + std::string(pcap_geterr(it->second.handle)), 0);
-
-            it->second.dumper = d;
+                praia::error(fn + "(): " + std::string(pcap_geterr(p)));
+            std::lock_guard<std::mutex> state(h->stateMu);
+            if (h->dumper) pcap_dump_close(h->dumper);
+            h->dumper = d;
             return Value();
         }));
 
     // pcap.dump(handle, data, timestamp?) -> nil
     module->entries["dump"] = Value(makeNative("pcap.dump", -1,
         [](const std::vector<Value>& args) -> Value {
-            if (args.size() < 2 || !args[0].isInt() || !args[1].isString())
-                throw RuntimeError("pcap.dump() requires handle and packet data", 0);
-
-            auto it = handles.find(args[0].asInt());
-            if (it == handles.end())
-                throw RuntimeError("pcap.dump(): invalid handle", 0);
-            if (!it->second.dumper)
-                throw RuntimeError("pcap.dump(): no dump file open (call dumpOpen first)", 0);
-
-            const auto& data = args[1].asString();
+            const std::string fn = "pcap.dump";
+            praia::requireArityRange(args, 2, 3, fn);
+            auto* h = argHandle(args, 0, fn);
+            const auto& data = praia::requireString(args, 1, fn);
+            if (data.size() > 0xFFFFFFFFull)
+                praia::error(fn + "(): packet too large");
 
             struct pcap_pkthdr hdr;
-            if (args.size() > 2 && args[2].isNumber()) {
-                double ts = args[2].asNumber();
-                hdr.ts.tv_sec = static_cast<time_t>(ts);
-                hdr.ts.tv_usec = static_cast<suseconds_t>((ts - hdr.ts.tv_sec) * 1000000);
+            if (args.size() > 2 && !args[2].isNil()) {
+                double ts = praia::requireNumber(args, 2, fn);
+                if (!std::isfinite(ts))
+                    praia::error(fn + "(): timestamp must be a finite number");
+                // floor, so a time before 1970 keeps tv_usec in [0, 1e6)
+                double sec = std::floor(ts);
+                hdr.ts.tv_sec = static_cast<time_t>(sec);
+                hdr.ts.tv_usec = static_cast<suseconds_t>(
+                    std::min(999999.0, std::round((ts - sec) * 1000000)));
             } else {
                 gettimeofday(&hdr.ts, nullptr);
             }
             hdr.caplen = static_cast<bpf_u_int32>(data.size());
             hdr.len = hdr.caplen;
 
-            pcap_dump(reinterpret_cast<u_char*>(it->second.dumper),
+            std::lock_guard<std::mutex> op(h->opMu);
+            openPcap(h, fn);
+            if (!h->dumper)
+                praia::error(fn + "(): no dump file open (call dumpOpen first)");
+            pcap_dump(reinterpret_cast<u_char*>(h->dumper),
                       &hdr, reinterpret_cast<const u_char*>(data.data()));
             return Value();
         }));
@@ -251,60 +308,46 @@ extern "C" void praia_register(PraiaMap* module) {
     // pcap.dumpFlush(handle) -> nil
     module->entries["dumpFlush"] = Value(makeNative("pcap.dumpFlush", 1,
         [](const std::vector<Value>& args) -> Value {
-            if (!args[0].isInt())
-                throw RuntimeError("pcap.dumpFlush() requires handle", 0);
-
-            auto it = handles.find(args[0].asInt());
-            if (it == handles.end())
-                throw RuntimeError("pcap.dumpFlush(): invalid handle", 0);
-            if (!it->second.dumper)
-                throw RuntimeError("pcap.dumpFlush(): no dump file open", 0);
-
-            if (pcap_dump_flush(it->second.dumper) < 0)
-                throw RuntimeError("pcap.dumpFlush(): flush failed", 0);
+            const std::string fn = "pcap.dumpFlush";
+            auto* h = argHandle(args, 0, fn);
+            std::lock_guard<std::mutex> op(h->opMu);
+            openPcap(h, fn);
+            if (!h->dumper)
+                praia::error(fn + "(): no dump file open");
+            if (pcap_dump_flush(h->dumper) < 0)
+                praia::error(fn + "(): flush failed");
             return Value();
         }));
 
     // pcap.dumpClose(handle) -> nil
     module->entries["dumpClose"] = Value(makeNative("pcap.dumpClose", 1,
         [](const std::vector<Value>& args) -> Value {
-            if (!args[0].isInt())
-                throw RuntimeError("pcap.dumpClose() requires handle", 0);
-
-            auto it = handles.find(args[0].asInt());
-            if (it == handles.end()) return Value();
-
-            if (it->second.dumper) {
-                pcap_dump_close(it->second.dumper);
-                it->second.dumper = nullptr;
+            auto* h = argHandle(args, 0, "pcap.dumpClose");
+            std::lock_guard<std::mutex> op(h->opMu);
+            std::lock_guard<std::mutex> state(h->stateMu);
+            if (h->dumper) {
+                pcap_dump_close(h->dumper);
+                h->dumper = nullptr;
             }
             return Value();
         }));
 
-    // pcap.close(handle) -> nil
+    // pcap.close(handle) -> nil. Closing twice is fine
     module->entries["close"] = Value(makeNative("pcap.close", 1,
         [](const std::vector<Value>& args) -> Value {
-            if (!args[0].isInt())
-                throw RuntimeError("pcap.close() requires handle", 0);
-
-            auto it = handles.find(args[0].asInt());
-            if (it == handles.end()) return Value();
-
-            if (it->second.dumper)
-                pcap_dump_close(it->second.dumper);
-            if (it->second.handle)
-                pcap_close(it->second.handle);
-            handles.erase(it);
+            auto* h = argHandle(args, 0, "pcap.close");
+            std::lock_guard<std::mutex> op(h->opMu);
+            closeHandle(h);
             return Value();
         }));
 
     // pcap.devices() -> [{name, description}]
     module->entries["devices"] = Value(makeNative("pcap.devices", 0,
-        [](const std::vector<Value>& args) -> Value {
+        [](const std::vector<Value>&) -> Value {
             char errbuf[PCAP_ERRBUF_SIZE];
             pcap_if_t* devs;
             if (pcap_findalldevs(&devs, errbuf) < 0)
-                throw RuntimeError("pcap.devices(): " + std::string(errbuf), 0);
+                praia::error("pcap.devices(): " + std::string(errbuf));
 
             auto arr = gcNew<PraiaArray>();
             for (auto* d = devs; d; d = d->next) {
@@ -319,6 +362,7 @@ extern "C" void praia_register(PraiaMap* module) {
             return Value(arr);
         }));
 
-    // pcap.DLT_EN10MB constant (Ethernet)
-    module->entries["DLT_EN10MB"] = Value(static_cast<int64_t>(DLT_EN10MB));
+    // Datalink types, to compare with pcap.datalink()
+    module->entries["DLT_EN10MB"] = Value(static_cast<int64_t>(DLT_EN10MB));                     // Ethernet
+    module->entries["DLT_IEEE802_11_RADIO"] = Value(static_cast<int64_t>(DLT_IEEE802_11_RADIO)); // 802.11 + radiotap
 }
