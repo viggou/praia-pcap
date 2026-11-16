@@ -11,6 +11,7 @@
 #include <cmath>
 #include <csignal>
 #include <limits>
+#include <poll.h>
 #include <cstring>
 #include <mutex>
 #include <sys/time.h>
@@ -29,15 +30,23 @@ PRAIA_PLUGIN_METADATA("pcap", "1.1.1",
 //   another task, and close() takes both, so neither ever sees a freed
 //   handle. closing is set first thing in close(): no new read starts
 //   after it, even one that would have consumed the break.
-// pcap_breakloop wakes a blocked read at once on Linux (libpcap 1.10+);
-// with BPF (macOS) the read only returns when the capture timeout ends,
-// which is why openLive requires one and caps it
+// How a blocked read is woken: on Linux a live capture is non-blocking and
+// next() waits on its fd in short slices, checking for close, breakLoop,
+// cancellation and Ctrl+C between them, so it works on any libpcap
+// version. With BPF (macOS) the read blocks and returns when the capture
+// timeout ends, which is why openLive requires one and caps it
 struct PcapHandle {
     std::timed_mutex opMu;
     std::mutex stateMu;
     std::atomic<bool> closing{false};
+    // breakLoop() on a pollFd capture: libpcap's own break flag isn't seen
+    // by a non-blocking read with no packets, and would linger to end a
+    // later read early, so these use this flag instead
+    std::atomic<bool> breakRequested{false};
     pcap_t* handle = nullptr;
     pcap_dumper_t* dumper = nullptr;
+    int pollFd = -1;        // live Linux capture in non-blocking mode
+    int timeoutMs = 0;      // for pollFd: how long one next() waits
 };
 static const char* kHandleType = "pcap.handle";
 
@@ -59,7 +68,7 @@ static void closeDumper(PcapHandle* h) {
 static void stopReads(PcapHandle* h) {
     h->closing = true;
     std::lock_guard<std::mutex> state(h->stateMu);
-    if (h->handle) pcap_breakloop(h->handle);
+    if (h->handle && h->pollFd < 0) pcap_breakloop(h->handle);
 }
 
 // Closes the dumper, then the handle (the documented libpcap order).
@@ -132,9 +141,20 @@ static int optInt(const std::vector<Value>& args, size_t i, int def, int lo, int
     return static_cast<int>(v);
 }
 
-static Value wrapHandle(pcap_t* p) {
+static Value wrapHandle(pcap_t* p, int timeoutMs = 0) {
     auto* h = new PcapHandle();
     h->handle = p;
+#ifdef __linux__
+    // Live captures only: a file is read without waiting
+    char errbuf[PCAP_ERRBUF_SIZE];
+    if (timeoutMs > 0 && pcap_setnonblock(p, 1, errbuf) == 0) {
+        h->pollFd = pcap_get_selectable_fd(p);
+        h->timeoutMs = timeoutMs;
+        if (h->pollFd < 0) pcap_setnonblock(p, 0, errbuf);
+    }
+#else
+    (void)timeoutMs;
+#endif
     {
         std::lock_guard<std::mutex> reg(g_regMu);
         g_handles->insert(h);
@@ -172,7 +192,7 @@ extern "C" void praia_register(PraiaMap* module) {
             pcap_t* p = pcap_open_live(iface.c_str(), snaplen, promisc, timeoutMs, errbuf);
             if (!p)
                 praia::error(fn + "(): " + std::string(errbuf));
-            return wrapHandle(p);
+            return wrapHandle(p, timeoutMs);
         }));
 
     // pcap.openFile(path) -> handle
@@ -217,15 +237,38 @@ extern "C" void praia_register(PraiaMap* module) {
             // reading, so a packet already read is always returned. Inside
             // a withCancel scope a cancelled token reads as a timeout: the
             // user's loop checks tok.cancelled() and cleans up
-            if (interrupted()) praia::error("Interrupted");
-            if (cancelled()) return Value();
-            if (h->closing) praia::error(fn + "(): the handle is closed");
-
-            std::lock_guard<std::timed_mutex> op(h->opMu);
+            // Another task's next() may hold the handle for up to its
+            // timeout; the wait for it is cancellable too. Checked again
+            // once the lock is held, so a cancelled task never starts a read
+            std::unique_lock<std::timed_mutex> op(h->opMu, std::defer_lock);
+            while (true) {
+                if (interrupted()) praia::error("Interrupted");
+                if (cancelled()) return Value();
+                if (h->closing) praia::error(fn + "(): the handle is closed");
+                if (op.owns_lock()) break;
+                if (op.try_lock_for(std::chrono::milliseconds(50)))
+                    continue;   // held: check once more, then read
+            }
             pcap_t* p = openPcap(h, fn);
             struct pcap_pkthdr* hdr;
             const u_char* pkt;
             int rc = pcap_next_ex(p, &hdr, &pkt);
+            if (rc == 0 && h->pollFd >= 0) {
+                // Non-blocking live capture: wait for the fd in slices
+                auto deadline = std::chrono::steady_clock::now() +
+                                std::chrono::milliseconds(h->timeoutMs);
+                while (rc == 0) {
+                    if (interrupted()) praia::error("Interrupted");
+                    if (cancelled() || h->closing) return Value();
+                    if (h->breakRequested.exchange(false)) return Value();
+                    auto left = std::chrono::duration_cast<std::chrono::milliseconds>(
+                        deadline - std::chrono::steady_clock::now()).count();
+                    if (left <= 0) return Value();   // timeout
+                    struct pollfd pfd = {h->pollFd, POLLIN, 0};
+                    ::poll(&pfd, 1, static_cast<int>(std::min<long long>(left, 100)));
+                    rc = pcap_next_ex(p, &hdr, &pkt);
+                }
+            }
 
             if (rc == 1) {
                 auto result = gcNew<PraiaMap>();
@@ -249,7 +292,8 @@ extern "C" void praia_register(PraiaMap* module) {
         [](const std::vector<Value>& args) -> Value {
             auto* h = argHandle(args, 0, "pcap.breakLoop");
             std::lock_guard<std::mutex> state(h->stateMu);
-            if (h->handle) pcap_breakloop(h->handle);
+            if (h->pollFd >= 0) h->breakRequested = true;
+            else if (h->handle) pcap_breakloop(h->handle);
             return Value();
         }));
 

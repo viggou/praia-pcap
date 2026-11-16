@@ -88,7 +88,7 @@ pcap.close(cap)
 
 | Function | Description |
 |----------|-------------|
-| `openLive(iface, snaplen?, promisc?, timeoutMs?)` | Open live capture. Defaults (also for `nil`): snaplen=65535, promisc=true, timeout=1000ms. The timeout must be 1ms to 60s: on macOS it's also how long `close` or `breakLoop` may wait for a `next` blocked in another task |
+| `openLive(iface, snaplen?, promisc?, timeoutMs?)` | Open live capture. Defaults (also for `nil`): snaplen=65535, promisc=true, timeout=1000ms. The timeout must be 1ms to 60s. On Linux, `close`, `breakLoop` and cancellation interrupt a waiting `next` within about 100ms; on macOS a `next` already waiting returns when its timeout ends |
 | `openFile(path)` | Open a pcap file for reading |
 | `setFilter(handle, filter)` | Apply a BPF filter (e.g. `"tcp port 80"`, `"arp"`, `"host 10.0.0.1"`) |
 | `next(handle)` | Read next packet. Returns `{data, timestamp, caplen, len}` or nil on timeout/EOF |
