@@ -10,7 +10,6 @@
 #include <chrono>
 #include <cmath>
 #include <csignal>
-#include <limits>
 #include <poll.h>
 #include <cstring>
 #include <mutex>
@@ -141,20 +140,31 @@ static int optInt(const std::vector<Value>& args, size_t i, int def, int lo, int
     return static_cast<int>(v);
 }
 
-static Value wrapHandle(pcap_t* p, int timeoutMs = 0) {
-    auto* h = new PcapHandle();
-    h->handle = p;
+static Value wrapHandle(pcap_t* p, const std::string& fn, int timeoutMs = 0) {
+    int pollFd = -1;
 #ifdef __linux__
-    // Live captures only: a file is read without waiting
-    char errbuf[PCAP_ERRBUF_SIZE];
-    if (timeoutMs > 0 && pcap_setnonblock(p, 1, errbuf) == 0) {
-        h->pollFd = pcap_get_selectable_fd(p);
-        h->timeoutMs = timeoutMs;
-        if (h->pollFd < 0) pcap_setnonblock(p, 0, errbuf);
+    // Live captures only (a file is read without waiting). A blocking read
+    // here can't be woken by close, breakLoop or cancellation, so a
+    // capture that can't be polled is refused rather than left blocking
+    if (timeoutMs > 0) {
+        char errbuf[PCAP_ERRBUF_SIZE];
+        if (pcap_setnonblock(p, 1, errbuf) != 0) {
+            pcap_close(p);
+            praia::error(fn + "(): can't make the capture non-blocking: " + std::string(errbuf));
+        }
+        pollFd = pcap_get_selectable_fd(p);
+        if (pollFd < 0) {
+            pcap_close(p);
+            praia::error(fn + "(): this capture source can't be polled");
+        }
     }
 #else
-    (void)timeoutMs;
+    (void)fn;
 #endif
+    auto* h = new PcapHandle();
+    h->handle = p;
+    h->pollFd = pollFd;
+    h->timeoutMs = timeoutMs;
     {
         std::lock_guard<std::mutex> reg(g_regMu);
         g_handles->insert(h);
@@ -192,7 +202,7 @@ extern "C" void praia_register(PraiaMap* module) {
             pcap_t* p = pcap_open_live(iface.c_str(), snaplen, promisc, timeoutMs, errbuf);
             if (!p)
                 praia::error(fn + "(): " + std::string(errbuf));
-            return wrapHandle(p, timeoutMs);
+            return wrapHandle(p, fn, timeoutMs);
         }));
 
     // pcap.openFile(path) -> handle
@@ -204,7 +214,7 @@ extern "C" void praia_register(PraiaMap* module) {
             pcap_t* p = pcap_open_offline(path.c_str(), errbuf);
             if (!p)
                 praia::error(fn + "(): " + std::string(errbuf));
-            return wrapHandle(p);
+            return wrapHandle(p, fn);
         }));
 
     // pcap.setFilter(handle, filter) -> nil
@@ -252,21 +262,28 @@ extern "C" void praia_register(PraiaMap* module) {
             pcap_t* p = openPcap(h, fn);
             struct pcap_pkthdr* hdr;
             const u_char* pkt;
-            int rc = pcap_next_ex(p, &hdr, &pkt);
-            if (rc == 0 && h->pollFd >= 0) {
-                // Non-blocking live capture: wait for the fd in slices
+            int rc;
+            if (h->pollFd < 0) {
+                // A file, or a BPF capture that returns at its timeout
+                rc = pcap_next_ex(p, &hdr, &pkt);
+            } else {
+                // Non-blocking live capture: wait for the fd in slices.
+                // Every read, the first too, comes after the checks, so a
+                // pending break, close or cancellation ends the wait
+                // without reading (and so without dropping) a packet
                 auto deadline = std::chrono::steady_clock::now() +
                                 std::chrono::milliseconds(h->timeoutMs);
-                while (rc == 0) {
+                while (true) {
                     if (interrupted()) praia::error("Interrupted");
                     if (cancelled() || h->closing) return Value();
                     if (h->breakRequested.exchange(false)) return Value();
+                    rc = pcap_next_ex(p, &hdr, &pkt);
+                    if (rc != 0) break;
                     auto left = std::chrono::duration_cast<std::chrono::milliseconds>(
                         deadline - std::chrono::steady_clock::now()).count();
                     if (left <= 0) return Value();   // timeout
                     struct pollfd pfd = {h->pollFd, POLLIN, 0};
                     ::poll(&pfd, 1, static_cast<int>(std::min<long long>(left, 100)));
-                    rc = pcap_next_ex(p, &hdr, &pkt);
                 }
             }
 
@@ -360,11 +377,12 @@ extern "C" void praia_register(PraiaMap* module) {
                 double ts = praia::requireNumber(args, 2, fn);
                 if (!std::isfinite(ts))
                     praia::error(fn + "(): timestamp must be a finite number");
-                // floor, so a time before 1970 keeps tv_usec in [0, 1e6)
+                // A savefile stores the seconds as an unsigned 32-bit field,
+                // which other tools read as such: 1970 up to early 2106
                 double sec = std::floor(ts);
-                if (sec < static_cast<double>(std::numeric_limits<time_t>::min()) ||
-                    sec >= static_cast<double>(std::numeric_limits<time_t>::max()))
-                    praia::error(fn + "(): timestamp out of range");
+                if (sec < 0 || sec > 4294967295.0)
+                    praia::error(fn + "(): timestamp out of range (a pcap file holds "
+                                 "times from 1970 to 2106)");
                 hdr.ts.tv_sec = static_cast<time_t>(sec);
                 hdr.ts.tv_usec = static_cast<suseconds_t>(
                     std::min(999999.0, std::round((ts - sec) * 1000000)));

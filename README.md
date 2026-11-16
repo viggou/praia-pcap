@@ -100,7 +100,7 @@ pcap.close(cap)
 | Function | Description |
 |----------|-------------|
 | `dumpOpen(handle, path)` | Open a pcap dump file for writing (attached to capture handle) |
-| `dump(handle, data, timestamp?)` | Write a packet to the dump file. Timestamp defaults to now |
+| `dump(handle, data, timestamp?)` | Write a packet to the dump file. Timestamp defaults to now; a pcap file holds times from 1970 to 2106 |
 | `dumpClose(handle)` | Close the dump file |
 
 ### Info
