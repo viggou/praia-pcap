@@ -6,8 +6,11 @@
 #include "praia_plugin.h"
 #include "signal_state.h"
 
+#include <atomic>
+#include <chrono>
 #include <cmath>
 #include <csignal>
+#include <limits>
 #include <cstring>
 #include <mutex>
 #include <sys/time.h>
@@ -21,12 +24,18 @@ PRAIA_PLUGIN_METADATA("pcap", "1.1.1",
 
 // A capture handle. Async tasks can share one, so:
 //   opMu serializes libpcap calls on it (held through a blocking next()),
-//   stateMu guards just the pointers, held only for a moment. breakLoop
-//   takes only stateMu, so it can interrupt a next() blocked in another
-//   task, and close() takes both, so neither ever sees a freed handle.
+//   stateMu guards the pointers and the dump file, held only for a moment.
+//   breakLoop takes only stateMu, so it can interrupt a next() blocked in
+//   another task, and close() takes both, so neither ever sees a freed
+//   handle. closing is set first thing in close(): no new read starts
+//   after it, even one that would have consumed the break.
+// pcap_breakloop wakes a blocked read at once on Linux (libpcap 1.10+);
+// with BPF (macOS) the read only returns when the capture timeout ends,
+// which is why openLive requires one and caps it
 struct PcapHandle {
-    std::mutex opMu;
+    std::timed_mutex opMu;
     std::mutex stateMu;
+    std::atomic<bool> closing{false};
     pcap_t* handle = nullptr;
     pcap_dumper_t* dumper = nullptr;
 };
@@ -37,15 +46,27 @@ static const char* kHandleType = "pcap.handle";
 static std::mutex g_regMu;
 static auto* g_handles = new std::unordered_set<PcapHandle*>();
 
-// Closes the dumper, then the handle (the documented libpcap order).
-// Call with opMu held; takes stateMu itself
-static void closeHandle(PcapHandle* h) {
-    std::lock_guard<std::mutex> state(h->stateMu);
+// Flushes and closes the dump file. Call with stateMu held
+static void closeDumper(PcapHandle* h) {
     if (h->dumper) {
         pcap_dump_flush(h->dumper);
         pcap_dump_close(h->dumper);
         h->dumper = nullptr;
     }
+}
+
+// Asks a read blocked on h to return, and stops new ones starting
+static void stopReads(PcapHandle* h) {
+    h->closing = true;
+    std::lock_guard<std::mutex> state(h->stateMu);
+    if (h->handle) pcap_breakloop(h->handle);
+}
+
+// Closes the dumper, then the handle (the documented libpcap order).
+// Call with opMu held; takes stateMu itself
+static void closeHandle(PcapHandle* h) {
+    std::lock_guard<std::mutex> state(h->stateMu);
+    closeDumper(h);
     if (h->handle) {
         pcap_close(h->handle);
         h->handle = nullptr;
@@ -60,7 +81,7 @@ static void freeHandle(PcapHandle* h) {
         g_handles->erase(h);
     }
     {
-        std::lock_guard<std::mutex> op(h->opMu);
+        std::lock_guard<std::timed_mutex> op(h->opMu);
         closeHandle(h);
     }
     delete h;
@@ -68,16 +89,21 @@ static void freeHandle(PcapHandle* h) {
 
 // Process-exit hook — flush + close any open pcap handles so capture
 // files aren't truncated on script crashes or sys.exit(). An unawaited
-// task may still be in next(), so each capture is told to stop first
+// task may still be in next(). The dump file only needs stateMu, so it's
+// always flushed and closed; the capture itself is closed if its read
+// returns soon, and otherwise left to the process exit
 extern "C" void praia_at_exit(void) {
     std::lock_guard<std::mutex> reg(g_regMu);
     for (auto* h : *g_handles) {
+        stopReads(h);
         {
             std::lock_guard<std::mutex> state(h->stateMu);
-            if (h->handle) pcap_breakloop(h->handle);
+            closeDumper(h);
         }
-        std::lock_guard<std::mutex> op(h->opMu);
-        closeHandle(h);
+        if (h->opMu.try_lock_for(std::chrono::milliseconds(250))) {
+            closeHandle(h);
+            h->opMu.unlock();
+        }
     }
 }
 
@@ -91,7 +117,7 @@ static PcapHandle* argHandle(const std::vector<Value>& args, size_t i, const std
 
 // The handle's pcap_t, with opMu held by the caller
 static pcap_t* openPcap(PcapHandle* h, const std::string& fn) {
-    if (!h->handle) praia::error(fn + "(): the handle is closed");
+    if (h->closing || !h->handle) praia::error(fn + "(): the handle is closed");
     return h->handle;
 }
 
@@ -138,7 +164,9 @@ extern "C" void praia_register(PraiaMap* module) {
                 promisc = praia::requireBool(args, 2, fn) ? 1 : 0;
             // 0 would mean "wait forever" on Linux, which nothing could
             // interrupt; next() returns nil on each timeout instead
-            int timeoutMs = optInt(args, 3, 1000, 1, 3600000, fn, "timeoutMs");
+            // At most a minute: on macOS it's also how long close() and
+            // breakLoop() can wait for a blocked next()
+            int timeoutMs = optInt(args, 3, 1000, 1, 60000, fn, "timeoutMs");
 
             char errbuf[PCAP_ERRBUF_SIZE];
             pcap_t* p = pcap_open_live(iface.c_str(), snaplen, promisc, timeoutMs, errbuf);
@@ -165,7 +193,7 @@ extern "C" void praia_register(PraiaMap* module) {
             const std::string fn = "pcap.setFilter";
             auto* h = argHandle(args, 0, fn);
             const auto& filter = praia::requireString(args, 1, fn);
-            std::lock_guard<std::mutex> op(h->opMu);
+            std::lock_guard<std::timed_mutex> op(h->opMu);
             pcap_t* p = openPcap(h, fn);
 
             struct bpf_program fp;
@@ -191,8 +219,9 @@ extern "C" void praia_register(PraiaMap* module) {
             // user's loop checks tok.cancelled() and cleans up
             if (interrupted()) praia::error("Interrupted");
             if (cancelled()) return Value();
+            if (h->closing) praia::error(fn + "(): the handle is closed");
 
-            std::lock_guard<std::mutex> op(h->opMu);
+            std::lock_guard<std::timed_mutex> op(h->opMu);
             pcap_t* p = openPcap(h, fn);
             struct pcap_pkthdr* hdr;
             const u_char* pkt;
@@ -229,7 +258,7 @@ extern "C" void praia_register(PraiaMap* module) {
         [](const std::vector<Value>& args) -> Value {
             const std::string fn = "pcap.stats";
             auto* h = argHandle(args, 0, fn);
-            std::lock_guard<std::mutex> op(h->opMu);
+            std::lock_guard<std::timed_mutex> op(h->opMu);
             pcap_t* p = openPcap(h, fn);
 
             struct pcap_stat ps;
@@ -248,7 +277,7 @@ extern "C" void praia_register(PraiaMap* module) {
         [](const std::vector<Value>& args) -> Value {
             const std::string fn = "pcap.datalink";
             auto* h = argHandle(args, 0, fn);
-            std::lock_guard<std::mutex> op(h->opMu);
+            std::lock_guard<std::timed_mutex> op(h->opMu);
             return Value(static_cast<int64_t>(pcap_datalink(openPcap(h, fn))));
         }));
 
@@ -258,14 +287,16 @@ extern "C" void praia_register(PraiaMap* module) {
             const std::string fn = "pcap.dumpOpen";
             auto* h = argHandle(args, 0, fn);
             const auto& path = praia::requireString(args, 1, fn);
-            std::lock_guard<std::mutex> op(h->opMu);
+            std::lock_guard<std::timed_mutex> op(h->opMu);
             pcap_t* p = openPcap(h, fn);
-
+            std::lock_guard<std::mutex> state(h->stateMu);
+            // The old file is closed first: pcap_dump_open truncates its
+            // path, and if that's the same file (by any name), the old
+            // dumper's buffered packets would otherwise land in it later
+            closeDumper(h);
             pcap_dumper_t* d = pcap_dump_open(p, path.c_str());
             if (!d)
                 praia::error(fn + "(): " + std::string(pcap_geterr(p)));
-            std::lock_guard<std::mutex> state(h->stateMu);
-            if (h->dumper) pcap_dump_close(h->dumper);
             h->dumper = d;
             return Value();
         }));
@@ -287,6 +318,9 @@ extern "C" void praia_register(PraiaMap* module) {
                     praia::error(fn + "(): timestamp must be a finite number");
                 // floor, so a time before 1970 keeps tv_usec in [0, 1e6)
                 double sec = std::floor(ts);
+                if (sec < static_cast<double>(std::numeric_limits<time_t>::min()) ||
+                    sec >= static_cast<double>(std::numeric_limits<time_t>::max()))
+                    praia::error(fn + "(): timestamp out of range");
                 hdr.ts.tv_sec = static_cast<time_t>(sec);
                 hdr.ts.tv_usec = static_cast<suseconds_t>(
                     std::min(999999.0, std::round((ts - sec) * 1000000)));
@@ -296,8 +330,9 @@ extern "C" void praia_register(PraiaMap* module) {
             hdr.caplen = static_cast<bpf_u_int32>(data.size());
             hdr.len = hdr.caplen;
 
-            std::lock_guard<std::mutex> op(h->opMu);
+            std::lock_guard<std::timed_mutex> op(h->opMu);
             openPcap(h, fn);
+            std::lock_guard<std::mutex> state(h->stateMu);
             if (!h->dumper)
                 praia::error(fn + "(): no dump file open (call dumpOpen first)");
             pcap_dump(reinterpret_cast<u_char*>(h->dumper),
@@ -310,8 +345,9 @@ extern "C" void praia_register(PraiaMap* module) {
         [](const std::vector<Value>& args) -> Value {
             const std::string fn = "pcap.dumpFlush";
             auto* h = argHandle(args, 0, fn);
-            std::lock_guard<std::mutex> op(h->opMu);
+            std::lock_guard<std::timed_mutex> op(h->opMu);
             openPcap(h, fn);
+            std::lock_guard<std::mutex> state(h->stateMu);
             if (!h->dumper)
                 praia::error(fn + "(): no dump file open");
             if (pcap_dump_flush(h->dumper) < 0)
@@ -323,12 +359,9 @@ extern "C" void praia_register(PraiaMap* module) {
     module->entries["dumpClose"] = Value(makeNative("pcap.dumpClose", 1,
         [](const std::vector<Value>& args) -> Value {
             auto* h = argHandle(args, 0, "pcap.dumpClose");
-            std::lock_guard<std::mutex> op(h->opMu);
+            std::lock_guard<std::timed_mutex> op(h->opMu);
             std::lock_guard<std::mutex> state(h->stateMu);
-            if (h->dumper) {
-                pcap_dump_close(h->dumper);
-                h->dumper = nullptr;
-            }
+            closeDumper(h);
             return Value();
         }));
 
@@ -336,7 +369,10 @@ extern "C" void praia_register(PraiaMap* module) {
     module->entries["close"] = Value(makeNative("pcap.close", 1,
         [](const std::vector<Value>& args) -> Value {
             auto* h = argHandle(args, 0, "pcap.close");
-            std::lock_guard<std::mutex> op(h->opMu);
+            // A read blocked in another task returns nil (at once on Linux,
+            // within its timeout on macOS) instead of holding this up
+            stopReads(h);
+            std::lock_guard<std::timed_mutex> op(h->opMu);
             closeHandle(h);
             return Value();
         }));
