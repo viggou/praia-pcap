@@ -10,7 +10,12 @@
 #include <chrono>
 #include <cmath>
 #include <csignal>
+#include <cerrno>
+#include <cstdio>
+#include <fcntl.h>
 #include <poll.h>
+#include <sys/stat.h>
+#include <unistd.h>
 #include <cstring>
 #include <mutex>
 #include <sys/time.h>
@@ -19,7 +24,7 @@
 #include <pcap/pcap.h>
 
 PRAIA_DECLARE_ABI();
-PRAIA_PLUGIN_METADATA("pcap", "1.1.1",
+PRAIA_PLUGIN_METADATA("pcap", "1.2.0",
                      "libpcap bindings for Praia");
 
 // A capture handle. Async tasks can share one, so:
@@ -210,10 +215,32 @@ extern "C" void praia_register(PraiaMap* module) {
         [](const std::vector<Value>& args) -> Value {
             const std::string fn = "pcap.openFile";
             const auto& path = praia::requireString(args, 0, fn);
+            // Regular files only: a read from a pipe or device can block
+            // with nothing to wake it, holding the handle so close() and
+            // breakLoop() can't finish. Checked on the opened descriptor
+            // (O_NONBLOCK so opening a FIFO doesn't wait for a writer),
+            // which is then the one libpcap reads
+            int fd = ::open(path.c_str(), O_RDONLY | O_NONBLOCK | O_CLOEXEC);
+            if (fd < 0)
+                praia::error(fn + "(): " + path + ": " + std::strerror(errno));
+            struct stat st;
+            if (::fstat(fd, &st) != 0 || !S_ISREG(st.st_mode)) {
+                ::close(fd);
+                praia::error(fn + "(): " + path + " is not a regular file (pipes and "
+                             "devices can't be read without blocking; use openLive to capture)");
+            }
+            ::fcntl(fd, F_SETFL, ::fcntl(fd, F_GETFL) & ~O_NONBLOCK);
+            FILE* f = ::fdopen(fd, "rb");
+            if (!f) {
+                ::close(fd);
+                praia::error(fn + "(): " + path + ": " + std::strerror(errno));
+            }
             char errbuf[PCAP_ERRBUF_SIZE];
-            pcap_t* p = pcap_open_offline(path.c_str(), errbuf);
-            if (!p)
+            pcap_t* p = pcap_fopen_offline(f, errbuf);
+            if (!p) {
+                std::fclose(f);
                 praia::error(fn + "(): " + std::string(errbuf));
+            }
             return wrapHandle(p, fn);
         }));
 
